@@ -8,238 +8,267 @@ import os
 import time
 from socket import gethostname
 from traitlets import (
-    Unicode,
-    Bool,
-    Dict,
-    Int
+	Unicode,
+	Bool,
+	Dict,
+	Int
 )
 
 from tornado import gen
 
 from jinja2 import Environment, FileSystemLoader
 
-def define_SwanSpawner_from(base_class):
-    """
-        The Spawner need to inherit from a proper upstream Spawner (i.e Docker or Kube).
-        But since our personalization, added on top of those, is exactly the same for all,
-        by allowing a dynamic inheritance we can re-use the same code on all cases.
-        This function returns our SwanSpawner, inheriting from a class (upstream Spawner)
-        given as parameter.
-    """
+from kubespawner import KubeSpawner
+from .binderspawner_mixin import BinderSpawnerMixin
 
-    class SwanSpawner(base_class):
+class SwanSpawner(KubeSpawner):
 
-        lcg_rel_field = 'LCG-rel'
+	lcg_rel_field = 'LCG-rel'
 
-        platform_field = 'platform'
+	platform_field = 'platform'
 
-        user_script_env_field = 'scriptenv'
+	user_script_env_field = 'scriptenv'
 
-        user_n_cores = 'ncores'
+	user_n_cores = 'ncores'
 
-        user_memory = 'memory'
+	user_memory = 'memory'
 
-        spark_cluster_field = 'spark-cluster'
+	spark_cluster_field = 'spark-cluster'
 
-        options_form_config = Unicode(
-            config=True,
-            help='Path to configuration file for options_form rendering.'
-        )
+	options_form_config = Unicode(
+		config=True,
+		help='Path to configuration file for options_form rendering.'
+	)
 
-        lcg_view_path = Unicode(
-            default_value='/cvmfs/sft.cern.ch/lcg/views',
-            config=True,
-            help='Path where LCG views are stored in CVMFS.'
-        )
+	lcg_view_path = Unicode(
+		default_value='/cvmfs/sft.cern.ch/lcg/views',
+		config=True,
+		help='Path where LCG views are stored in CVMFS.'
+	)
 
-        local_home = Bool(
-            default_value=False,
-            config=True,
-            help="If True, a physical directory on the host will be the scratch space, otherwise EOS."
-        )
+	local_home = Bool(
+		default_value=False,
+		config=True,
+		help="If True, a physical directory on the host will be the scratch space, otherwise EOS."
+	)
 
-        eos_path_format = Unicode(
-            default_value='/eos/user/{username[0]}/{username}/',
-            config=True,
-            help='Path format of the users home folder in EOS.'
-        )
+	eos_path_format = Unicode(
+		default_value='/eos/user/{username[0]}/{username}/',
+		config=True,
+		help='Path format of the users home folder in EOS.'
+	)
 
-        extra_env = Dict(
-            config=True,
-            help='Extra environment variables to pass to the container',
-        )
+	extra_env = Dict(
+		config=True,
+		help='Extra environment variables to pass to the container',
+	)
 
-        extended_timeout = Int(
-            default_value=120,
-            config=True,
-            help="Extended timeout for users using environment script"
-        )
+	extended_timeout = Int(
+		default_value=120,
+		config=True,
+		help="Extended timeout for users using environment script"
+	)
 
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self.this_host = gethostname().split('.')[0]
-            if not self.options_form and self.options_form_config:
-                # if options_form not provided, use templated options form based on configuration file
-                self.options_form = self._render_templated_options_form
+	def __init__(self, **kwargs):
+		super().__init__(**kwargs)
+		self.this_host = gethostname().split('.')[0]
+		if not self.options_form and self.options_form_config:
+			# if options_form not provided, use templated options form based on configuration file
+			self.options_form = self._render_templated_options_form
 
-        def options_from_form(self, formdata):
-            options = {}
-            options[self.lcg_rel_field]         = formdata[self.lcg_rel_field][0]
-            options[self.platform_field]        = formdata[self.platform_field][0]
-            options[self.user_script_env_field] = formdata[self.user_script_env_field][0]
-            options[self.spark_cluster_field]   = formdata[self.spark_cluster_field][0] if self.spark_cluster_field in formdata.keys() else 'none'
-            options[self.user_n_cores]          = int(formdata[self.user_n_cores][0])
-            options[self.user_memory]           = formdata[self.user_memory][0] + 'G'
+	def options_from_form(self, formdata):
+		options = {}
+		options[self.lcg_rel_field]         = formdata[self.lcg_rel_field][0]
+		options[self.platform_field]        = formdata[self.platform_field][0]
+		options[self.user_script_env_field] = formdata[self.user_script_env_field][0]
+		options[self.spark_cluster_field]   = formdata[self.spark_cluster_field][0] if self.spark_cluster_field in formdata.keys() else 'none'
+		options[self.user_n_cores]          = int(formdata[self.user_n_cores][0])
+		options[self.user_memory]           = formdata[self.user_memory][0] + 'G'
 
-            self.offload = options[self.spark_cluster_field] != 'none'
+		self.offload = options[self.spark_cluster_field] != 'none'
 
-            return options
+		return options
 
-        def get_env(self):
-            """ Set base environmental variables for swan jupyter docker image """
-            env = super().get_env()
+	def get_env(self):
+		""" Set base environmental variables for swan jupyter docker image """
+		env = super().get_env()
 
-            username = self.user.name
-            if self.local_home:
-                homepath = "/scratch/%s" %(username)
-            else:
-                homepath = self.eos_path_format.format(username = username)
+		try:
+			# Enabling GPU for cuda stacks
+			# Options to export nvidia device can be found in https://github.com/NVIDIA/nvidia-container-runtime#nvidia_require_
+			if "cu" in self.user_options[self.lcg_rel_field]:
+				env.update(dict(
+					NVIDIA_VISIBLE_DEVICES      = 'all',  # We are making visible all the devices, if the host has more that one can be used.
+					NVIDIA_DRIVER_CAPABILITIES  = 'compute,utility',
+					NVIDIA_REQUIRE_CUDA         = 'cuda>=10.0 driver>=410',
+				))
+		except:
+			pass
 
-            if not hasattr(self, 'user_uid'):
-                raise Exception('Authenticator needs to set user uid (in pre_spawn_start)')
+		username = self.user.name
+		if self.local_home:
+			homepath = "/scratch/%s" %(username)
+		else:
+			homepath = self.eos_path_format.format(username = username)
 
-            #FIXME remove userrid and username and just use jovyan 
-            #FIXME clean JPY env variables
-            if self.lcg_rel_field in self.user_options:
-                # session spawned via the form
-                env.update(dict(
-                    ROOT_LCG_VIEW_NAME     = self.user_options[self.lcg_rel_field],
-                    ROOT_LCG_VIEW_PLATFORM = self.user_options[self.platform_field],
-                    USER_ENV_SCRIPT        = self.user_options[self.user_script_env_field],
-                    ROOT_LCG_VIEW_PATH     = self.lcg_view_path,
-                    USER                   = username,
-                    USER_ID                = self.user_uid,
-                    NB_UID                 = self.user_uid,
-                    HOME                   = homepath,
-                    EOS_PATH_FORMAT        = self.eos_path_format,
-                    SERVER_HOSTNAME        = os.uname().nodename,
+		if not hasattr(self, 'user_uid'):
+			self.log.warning('Not setting uid (can be set in pre_spawn_start, useless in binder)')
 
-                    JPY_USER               = self.user.name,
-                    JPY_COOKIE_NAME        = self.user.server.cookie_name,
-                    JPY_BASE_URL           = self.user.base_url,
-                    JPY_HUB_PREFIX         = self.hub.base_url,
-                    JPY_HUB_API_URL        = self.hub.api_url
-                ))
-            else:
-                # session spawned via the API
-                env.update(dict(
-                    USER                   = "jovyan",
-                    HOME                   = "/home/jovyan",
-                    NB_USER                = 'jovyan',
-                    USER_ID                = 1000,
-                    NB_UID                 = 1000,
-                    SERVER_HOSTNAME        = os.uname().nodename,
-                ))
+		#FIXME remove userrid and username and just use jovyan 
+		#FIXME clean JPY env variables
+		if self.lcg_rel_field in self.user_options:
+			# session spawned via the form
+			env.update(dict(
+				ROOT_LCG_VIEW_NAME     = self.user_options[self.lcg_rel_field],
+				ROOT_LCG_VIEW_PLATFORM = self.user_options[self.platform_field],
+				USER_ENV_SCRIPT        = self.user_options[self.user_script_env_field],
+				ROOT_LCG_VIEW_PATH     = self.lcg_view_path,
+				USER                   = username,
+				USER_ID                = self.user_uid,
+				NB_UID                 = self.user_uid,
+				HOME                   = homepath,
+				EOS_PATH_FORMAT        = self.eos_path_format,
+				SERVER_HOSTNAME        = os.uname().nodename,
 
-            if self.extra_env:
-                env.update(self.extra_env)
+				JPY_USER               = self.user.name,
+				JPY_COOKIE_NAME        = self.user.server.cookie_name,
+				JPY_BASE_URL           = self.user.base_url,
+				JPY_HUB_PREFIX         = self.hub.base_url,
+				JPY_HUB_API_URL        = self.hub.api_url
+			))
+		else:
+			# session spawned via the API
+			env.update(dict(
+				USER                   = "jovyan",
+				HOME                   = "/home/jovyan",
+				NB_USER                = 'jovyan',
+				USER_ID                = 1000,
+				NB_UID                 = 1000,
+				SERVER_HOSTNAME        = os.uname().nodename,
+			))
 
-            return env
+		if self.extra_env:
+			env.update(self.extra_env)
 
-        @gen.coroutine
-        def stop(self, now=False):
-            """ Overwrite default spawner to report stop of the container """
+		return env
 
-            if self._spawn_future and not self._spawn_future.done():
-                # Return 124 (timeout) exit code as container got stopped by jupyterhub before successful spawn
-                container_exit_code = "124"
-            else:
-                # Return 0 exit code as container got stopped after spawning correctly
-                container_exit_code = "0"
+	@gen.coroutine
+	def stop(self, now=False):
+		""" Overwrite default spawner to report stop of the container """
 
-            stop_result = yield super().stop(now)
+		if self._spawn_future and not self._spawn_future.done():
+			# Return 124 (timeout) exit code as container got stopped by jupyterhub before successful spawn
+			container_exit_code = "124"
+		else:
+			# Return 0 exit code as container got stopped after spawning correctly
+			container_exit_code = "0"
 
-            self.log_metric(
-                self.user.name,
-                self.this_host,
-                ".".join(["exit_container_code"]),
-                container_exit_code
-            )
+		stop_result = yield super().stop(now)
 
-            return stop_result
+		self.log_metric(
+			self.user.name,
+			self.this_host,
+			".".join(["exit_container_code"]),
+			container_exit_code
+		)
 
-        @gen.coroutine
-        def poll(self):
-            """ Overwrite default poll to get status of container """
-            container_exit_code = yield super().poll()
+		return stop_result
 
-            # None if single - user process is running.
-            # Integer exit code status, if it is not running and not stopped by JupyterHub.
-            if container_exit_code is not None:
-                exit_return_code = str(container_exit_code)
-                if exit_return_code.isdigit():
-                    value_cleaned = exit_return_code
-                else:
-                    result = re.search('ExitCode=(\d+)', exit_return_code)
-                    if not result:
-                        raise Exception("unknown exit code format for this Spawner")
-                    value_cleaned = result.group(1)
+	@gen.coroutine
+	def poll(self):
+		""" Overwrite default poll to get status of container """
+		container_exit_code = yield super().poll()
 
-                self.log_metric(
-                    self.user.name,
-                    self.this_host,
-                    ".".join(["exit_container_code"]),
-                    value_cleaned
-                )
+		# None if single - user process is running.
+		# Integer exit code status, if it is not running and not stopped by JupyterHub.
+		if container_exit_code is not None:
+			exit_return_code = str(container_exit_code)
+			if exit_return_code.isdigit():
+				value_cleaned = exit_return_code
+			else:
+				result = re.search('ExitCode=(\d+)', exit_return_code)
+				if not result:
+					raise Exception("unknown exit code format for this Spawner")
+				value_cleaned = result.group(1)
 
-            return container_exit_code
+			self.log_metric(
+				self.user.name,
+				self.this_host,
+				".".join(["exit_container_code"]),
+				value_cleaned
+			)
 
-        @gen.coroutine
-        def start(self):
-            """
-            Start the container
-            """
+		return container_exit_code
 
-            start_time_start_container = time.time()
-            
-            #if the user script exists, we allow extended timeout
-            if self.user_options[self.user_script_env_field].strip()!='':
-                self.start_timeout = self.extended_timeout
+	@gen.coroutine
+	def start(self):
+		"""
+		Start the container
+		"""
 
-            # start configured container
-            startup = yield super().start()
+		self.log.info('in the swanspawner start')
+		print('in the swanspawner start')
+		start_time_start_container = time.time()
+		
+		#if the user script exists, we allow extended timeout
+		try:
+			if self.user_options[self.user_script_env_field].strip()!='':
+				self.start_timeout = self.extended_timeout
+		except:
+			pass
+		try:
+			# Enabling GPU for cuda stacks
+			# Options to export nvidia device can be found in https://github.com/NVIDIA/nvidia-container-runtime#nvidia_require_
+			if "cu" in self.user_options[self.lcg_rel_field]:
+				self.extra_resource_guarantees["nvidia.com/gpu"] = "1"
+				self.extra_resource_limits["nvidia.com/gpu"] = "1"
+			elif "nvidia.com/gpu" in self.extra_resource_guarantees:
+				del self.extra_resource_guarantees["nvidia.com/gpu"]
+				del self.extra_resource_limits["nvidia.com/gpu"]
 
-            self.log_metric(
-                self.user.name,
-                self.this_host,
-                ".".join(["start_container_duration_sec"]),
-                time.time() - start_time_start_container
-            )
+			self.cpu_limit = self.user_options[self.user_n_cores]
+			self.mem_limit = self.user_options[self.user_memory]
 
-            return startup
+			# start configured container
+			startup = yield super().start()
 
-        def log_metric(self, user, host, metric, value):
-            """ Function allowing for logging formatted metrics """
-            self.log.info("user: %s, host: %s, metric: %s, value: %s" % (user, host, metric, value))
+		except BaseException as e:
+			self.log.error("Error while spawning the user container: %s", e, exc_info=True)
+			self.log.error("probably in bindeeeeer" )
+			startup = yield super().start()
 
-        def _render_templated_options_form(self, spawner):
-            """
-            Render a form from a template based on options_form_config json config file
-            """
-            templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
-            env = Environment(loader=FileSystemLoader(templates_dir))
-            template = env.get_template('options_form_template.html')
+		self.log_metric(
+			self.user.name,
+			self.this_host,
+			".".join(["start_container_duration_sec"]),
+			time.time() - start_time_start_container
+		)
 
-            try:
-                with open(self.options_form_config) as json_file:
-                    options_form_config = json.load(json_file)
+		return startup
 
-                return template.render(options_form_config=options_form_config)
-            except Exception as ex:
-                self.log.error("Could not initialize form: %s", ex, exc_info=True)
-                raise RuntimeError(
-                    """
-                    Could not initialize form, invalid format
-                    """)
+	def log_metric(self, user, host, metric, value):
+		""" Function allowing for logging formatted metrics """
+		self.log.info("user: %s, host: %s, metric: %s, value: %s" % (user, host, metric, value))
 
-    return SwanSpawner
+	def _render_templated_options_form(self, spawner):
+		"""
+		Render a form from a template based on options_form_config json config file
+		"""
+		templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
+		env = Environment(loader=FileSystemLoader(templates_dir))
+		template = env.get_template('options_form_template.html')
+
+		try:
+			with open(self.options_form_config) as json_file:
+				options_form_config = json.load(json_file)
+
+			return template.render(options_form_config=options_form_config)
+		except Exception as ex:
+			self.log.error("Could not initialize form: %s", ex, exc_info=True)
+			raise RuntimeError(
+				"""
+				Could not initialize form, invalid format
+				""")
+
+class SwanBinderSpawner(BinderSpawnerMixin, SwanSpawner):
+	pass
